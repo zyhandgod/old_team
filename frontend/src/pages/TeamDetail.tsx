@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Card, Table, Button, Space, Tag, Descriptions, Spin, Input, message, Row, Col, Progress, Alert } from 'antd'
+import { Card, Table, Button, Space, Tag, Descriptions, Spin, Input, message, Row, Col, Progress } from 'antd'
 import { ArrowLeftOutlined, SyncOutlined, SearchOutlined, DownloadOutlined, DeleteOutlined, WarningOutlined } from '@ant-design/icons'
 import { Popconfirm } from 'antd'
 import { teamApi } from '../api'
@@ -103,8 +103,6 @@ export default function TeamDetail() {
       setPendingInvites(pendingInvites.filter(i => i.email_address !== email))
     } catch {}
   }
-
-  const unauthorizedMembers = members.filter(m => m.is_unauthorized)
 
   const memberColumns = [
     { 
@@ -236,27 +234,6 @@ export default function TeamDetail() {
           <Descriptions.Item label="创建时间">{formatDate(team?.created_at, 'YYYY-MM-DD HH:mm')}</Descriptions.Item>
         </Descriptions>
       </Card>
-
-      {/* 未授权成员警告 */}
-      {unauthorizedMembers.length > 0 && (
-        <Alert
-          message={`发现 ${unauthorizedMembers.length} 个未授权成员`}
-          description={
-            <div>
-              <p style={{ margin: '8px 0' }}>以下成员不是通过系统邀请的，可能是有人私自拉人进 Team：</p>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {unauthorizedMembers.map(m => (
-                  <Tag key={m.id} color="red">{m.email}</Tag>
-                ))}
-              </div>
-            </div>
-          }
-          type="error"
-          showIcon
-          icon={<WarningOutlined />}
-          style={{ marginBottom: 20 }}
-        />
-      )}
 
       {/* 成员列表 */}
       <Card

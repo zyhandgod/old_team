@@ -33,6 +33,7 @@ export default function Teams() {
   const [syncing, setSyncing] = useState<number | null>(null)
   const [syncingAll, setSyncingAll] = useState(false)
   const [groups, setGroups] = useState<Group[]>([])
+  const [guideModalOpen, setGuideModalOpen] = useState(false)
   const [form] = Form.useForm()
   const navigate = useNavigate()
   const { teams, setTeams } = useStore()
@@ -271,6 +272,17 @@ export default function Teams() {
               ))}
             </Select>
           </Form.Item>
+          {!editingTeam && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+              <Button
+                type="link"
+                onClick={() => setGuideModalOpen(true)}
+                style={{ padding: 0, height: 'auto', fontSize: 13 }}
+              >
+                查看获取方法
+              </Button>
+            </div>
+          )}
           <Form.Item 
             name="account_id" 
             label="Account ID" 
@@ -304,6 +316,51 @@ export default function Teams() {
             <Input type="number" placeholder="5" size="large" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="Team Token 获取方法"
+        open={guideModalOpen}
+        onCancel={() => setGuideModalOpen(false)}
+        footer={
+          <Button type="primary" onClick={() => setGuideModalOpen(false)}>
+            我知道了
+          </Button>
+        }
+        width={720}
+      >
+        <div style={{ color: '#475569', lineHeight: 1.8 }}>
+          <ol style={{ margin: '0 0 16px 18px', padding: 0 }}>
+            <li>登录 ChatGPT Team 管理后台</li>
+            <li>按 `F12` 打开开发者工具，切到 `Network`</li>
+            <li>筛选 `backend-api`</li>
+            <li>点击任意请求，查看 `Request Headers`</li>
+          </ol>
+
+          <div style={{ fontWeight: 600, marginBottom: 6, color: '#1e293b' }}>Account ID</div>
+          <div style={{ marginBottom: 6 }}>从 URL 中获取：</div>
+          <pre style={{ margin: '0 0 16px', padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.04)', overflowX: 'auto', fontSize: 12 }}>
+{`https://chatgpt.com/backend-api/accounts/eabecad0-0c6a-4932-aeb4-4ad932280677/users
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                        这就是 Account ID`}
+          </pre>
+
+          <div style={{ fontWeight: 600, marginBottom: 6, color: '#1e293b' }}>Session Token</div>
+          <div style={{ marginBottom: 6 }}>从 Headers 中找：</div>
+          <pre style={{ margin: '0 0 16px', padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.04)', overflowX: 'auto', fontSize: 12 }}>
+{`Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+                      ^^^^^^^^^^^^^^^^^^^^^^^
+                      复制 Bearer 后面的内容`}
+          </pre>
+
+          <div style={{ fontWeight: 600, marginBottom: 6, color: '#1e293b' }}>Device ID</div>
+          <div style={{ marginBottom: 6 }}>从 Headers 中找：</div>
+          <pre style={{ margin: 0, padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.04)', overflowX: 'auto', fontSize: 12 }}>
+{`oai-device-id: 0f404cce-2645-42e0-8163-80947354fad3
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+               复制这个值`}
+          </pre>
+        </div>
       </Modal>
     </div>
   )

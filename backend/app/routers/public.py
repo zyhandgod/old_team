@@ -2,6 +2,7 @@
 from datetime import datetime
 import httpx
 import secrets
+import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -15,7 +16,7 @@ from app.models import (
 )
 from app.services.chatgpt_api import ChatGPTAPI, ChatGPTAPIError
 from app.services.telegram import notify_new_invite
-from app.limiter import limiter
+from app.limiter import limiter, get_real_ip
 from app.logger import get_logger
 
 router = APIRouter(prefix="/public", tags=["public"])
@@ -24,6 +25,32 @@ logger = get_logger(__name__)
 # 全局并发控制：最多同时处理 10 个兑换请求
 import asyncio
 _redeem_semaphore = asyncio.Semaphore(10)
+REDEEM_COOLDOWN_SECONDS = 5
+_redeem_cooldowns: dict[str, float] = {}
+_redeem_cooldown_lock = asyncio.Lock()
+
+
+async def enforce_redeem_cooldown(request: Request, scope: str):
+    """服务端兑换冷却，避免刷新页面绕过前端倒计时"""
+    client_ip = get_real_ip(request) or "unknown"
+    key = f"{scope}:{client_ip}"
+    now = time.monotonic()
+
+    async with _redeem_cooldown_lock:
+        expired_keys = [cooldown_key for cooldown_key, expires_at in _redeem_cooldowns.items() if expires_at <= now]
+        for expired_key in expired_keys:
+            _redeem_cooldowns.pop(expired_key, None)
+
+        expires_at = _redeem_cooldowns.get(key, 0)
+        if expires_at > now:
+            retry_after = max(1, int(expires_at - now + 0.999))
+            raise HTTPException(
+                status_code=429,
+                detail=f"请求过于频繁，请在 {retry_after} 秒后再试",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        _redeem_cooldowns[key] = now + REDEEM_COOLDOWN_SECONDS
 
 
 def get_config(db: Session, key: str) -> Optional[str]:
@@ -437,6 +464,7 @@ async def get_seat_stats(db: Session = Depends(get_db)):
 @limiter.limit("5/minute")  # 每分钟最多5次
 async def use_redeem_code(request: Request, data: RedeemRequest, db: Session = Depends(get_db)):
     """使用兑换码加入 Team"""
+    await enforce_redeem_cooldown(request, "redeem")
     # 并发控制
     async with _redeem_semaphore:
         return await _do_redeem(data, db)
@@ -566,6 +594,7 @@ async def get_direct_code_info(code: str, db: Session = Depends(get_db)):
 @limiter.limit("5/minute")  # 每分钟最多5次
 async def direct_redeem(request: Request, data: DirectRedeemRequest, db: Session = Depends(get_db)):
     """直接兑换（无需登录，只需邮箱和兑换码）"""
+    await enforce_redeem_cooldown(request, "direct_redeem")
     # 并发控制
     async with _redeem_semaphore:
         return await _do_direct_redeem(data, db)

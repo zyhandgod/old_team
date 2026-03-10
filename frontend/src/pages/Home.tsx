@@ -3,6 +3,8 @@ import { Card, Input, Button, message, Spin, Result, Steps, Alert } from 'antd'
 import { GiftOutlined, MailOutlined, CheckCircleOutlined } from '@ant-design/icons'
 import { publicApi } from '../api'
 
+const HOME_REDEEM_COOLDOWN_KEY = 'home_redeem_cooldown_until'
+
 interface SeatStats {
   available_seats: number
 }
@@ -20,12 +22,30 @@ export default function Home() {
   const [seats, setSeats] = useState<SeatStats | null>(null)
   const [siteConfig, setSiteConfig] = useState<SiteConfig | null>(null)
   const [step, setStep] = useState(0)
+  const [cooldown, setCooldown] = useState(0)
   
   // 表单
   const [email, setEmail] = useState('')
   const [redeemCode, setRedeemCode] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [result, setResult] = useState<{ success: boolean; message: string; team?: string } | null>(null)
+
+  const syncCooldownFromStorage = () => {
+    const stored = Number(localStorage.getItem(HOME_REDEEM_COOLDOWN_KEY))
+    if (!stored || stored <= Date.now()) {
+      localStorage.removeItem(HOME_REDEEM_COOLDOWN_KEY)
+      setCooldown(0)
+      return
+    }
+
+    setCooldown(Math.ceil((stored - Date.now()) / 1000))
+  }
+
+  const startCooldown = (seconds: number) => {
+    const cooldownUntil = Date.now() + seconds * 1000
+    localStorage.setItem(HOME_REDEEM_COOLDOWN_KEY, String(cooldownUntil))
+    setCooldown(seconds)
+  }
 
   useEffect(() => {
     // 获取站点配置
@@ -39,8 +59,22 @@ export default function Home() {
     
     // 获取座位统计
     publicApi.getSeats().then((res: any) => setSeats(res)).catch(() => {})
+    syncCooldownFromStorage()
     setLoading(false)
   }, [])
+
+  useEffect(() => {
+    if (cooldown <= 0) {
+      localStorage.removeItem(HOME_REDEEM_COOLDOWN_KEY)
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      syncCooldownFromStorage()
+    }, 1000)
+
+    return () => window.clearTimeout(timer)
+  }, [cooldown])
 
   const handleSubmit = async () => {
     if (!email || !email.includes('@')) {
@@ -52,6 +86,7 @@ export default function Home() {
       return
     }
 
+    startCooldown(5)
     setSubmitting(true)
     try {
       const res: any = await publicApi.redeem({
@@ -61,6 +96,10 @@ export default function Home() {
       setResult({ success: true, message: res.message, team: res.team_name })
       setStep(1)
     } catch (e: any) {
+      const retryAfterHeader = Number(e.response?.headers?.['retry-after'])
+      if (e.response?.status === 429 && Number.isFinite(retryAfterHeader) && retryAfterHeader > 0) {
+        startCooldown(retryAfterHeader)
+      }
       message.error(e.response?.data?.detail || '兑换失败')
     } finally {
       setSubmitting(false)
@@ -199,10 +238,10 @@ export default function Home() {
               size="large" 
               loading={submitting}
               onClick={handleSubmit}
-              disabled={!email || !redeemCode}
+              disabled={!email || !redeemCode || cooldown > 0 || submitting}
               style={{ height: 48, borderRadius: 12, fontWeight: 600 }}
             >
-              立即兑换
+              {submitting ? '提交中...' : cooldown > 0 ? `${cooldown}s 后可再试` : '立即兑换'}
             </Button>
           </div>
         )}
