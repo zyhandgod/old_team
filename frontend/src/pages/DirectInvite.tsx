@@ -21,6 +21,7 @@ export default function DirectInvite() {
   const [submitting, setSubmitting] = useState(false)
   const [success, setSuccess] = useState(false)
   const [teamName, setTeamName] = useState('')
+  const [successMessage, setSuccessMessage] = useState('')
   const [siteConfig, setSiteConfig] = useState<SiteConfig | null>(null)
 
   useEffect(() => {
@@ -63,6 +64,7 @@ export default function DirectInvite() {
       })
       setSuccess(true)
       setTeamName(res.data.team_name)
+      setSuccessMessage(res.data.message || '')
     } catch (e: any) {
       message.error(e.response?.data?.detail || '兑换失败')
     } finally {
@@ -143,7 +145,8 @@ export default function DirectInvite() {
             title="邀请已发送！"
             subTitle={
               <div>
-                <p>已加入 {teamName || 'Team'}</p>
+                <p>{successMessage || '邀请已发送，请查收邮箱并接受邀请'}</p>
+                {teamName && <p>已分配到 {teamName}</p>}
                 <p style={{ color: '#f59e0b', fontSize: 13, marginTop: 12 }}>
                   {siteConfig?.success_message || '请查收邮箱并接受邀请'}
                 </p>

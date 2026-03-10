@@ -50,6 +50,19 @@ async def send_invite_telegram_notify(db: Session, email: str, team_name: str, r
         logger.warning(f"Telegram notify failed: {e}")
 
 
+def rollback_redeem_code_usage(db: Session, code_id: int):
+    """在邀请最终失败时回滚兑换码使用次数"""
+    from sqlalchemy import update
+
+    db.execute(
+        update(RedeemCode)
+        .where(RedeemCode.id == code_id)
+        .where(RedeemCode.used_count > 0)
+        .values(used_count=RedeemCode.used_count - 1)
+    )
+    db.commit()
+
+
 # ========== 站点配置 ==========
 class SiteConfig(BaseModel):
     site_title: str = "ChatGPT Team 自助上车"
@@ -119,6 +132,70 @@ def get_available_team(db: Session, group_id: Optional[int] = None, group_name: 
     return available_team
 
 
+async def send_invite_immediately(
+    db: Session,
+    email: str,
+    redeem_code: str,
+    group_id: Optional[int] = None,
+    linuxdo_user_id: Optional[int] = None,
+) -> Team:
+    """立即发送邀请，401 时自动切到同分组下一个可用 Team"""
+    from sqlalchemy import func
+    from app.cache import invalidate_seat_cache
+
+    team_query = db.query(Team).filter(Team.is_active == True)
+    if group_id:
+        team_query = team_query.filter(Team.group_id == group_id)
+
+    member_count_subq = db.query(
+        TeamMember.team_id,
+        func.count(TeamMember.id).label("member_count")
+    ).group_by(TeamMember.team_id).subquery()
+
+    candidate_teams = team_query.outerjoin(
+        member_count_subq,
+        Team.id == member_count_subq.c.team_id
+    ).filter(
+        func.coalesce(member_count_subq.c.member_count, 0) < Team.max_seats
+    ).order_by(Team.id).all()
+
+    if not candidate_teams:
+        raise HTTPException(status_code=503, detail="所有 Team 已满，请稍后再试")
+
+    last_error = "所有可用 Team 邀请失败"
+
+    for team in candidate_teams:
+        api = ChatGPTAPI(team.session_token, team.device_id or "", team.cookie or "")
+        try:
+            await api.invite_members(team.account_id, [email])
+        except ChatGPTAPIError as e:
+            last_error = e.message
+            if e.status_code == 401:
+                logger.warning("Skip expired team token during redeem", extra={
+                    "team": team.name,
+                    "team_id": team.id,
+                    "group_id": group_id,
+                    "email": email,
+                })
+                continue
+            raise HTTPException(status_code=503, detail=e.message)
+
+        invite = InviteRecord(
+            team_id=team.id,
+            email=email,
+            linuxdo_user_id=linuxdo_user_id,
+            status=InviteStatus.SUCCESS,
+            redeem_code=redeem_code,
+            batch_id=f"public-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        )
+        db.add(invite)
+        db.commit()
+        invalidate_seat_cache()
+        return team
+
+    raise HTTPException(status_code=503, detail=last_error)
+
+
 # ========== Schemas ==========
 class LinuxDOAuthURL(BaseModel):
     auth_url: str
@@ -144,7 +221,7 @@ class LinuxDOUserInfo(BaseModel):
 class RedeemRequest(BaseModel):
     email: EmailStr
     redeem_code: str
-    linuxdo_token: str
+    linuxdo_token: Optional[str] = None
 
 
 class RedeemResponse(BaseModel):
@@ -366,12 +443,12 @@ async def use_redeem_code(request: Request, data: RedeemRequest, db: Session = D
 
 
 async def _do_redeem(data: RedeemRequest, db: Session):
-    """实际执行兑换逻辑 - 排队模式"""
-    from app.tasks import enqueue_invite
+    """实际执行兑换逻辑 - 成功后才返回"""
     from app.models import TeamGroup
     
-    # 验证用户
-    user = get_linuxdo_user_from_token(db, data.linuxdo_token)
+    user = None
+    if data.linuxdo_token:
+        user = get_linuxdo_user_from_token(db, data.linuxdo_token)
     
     # 验证兑换码
     code = db.query(RedeemCode).filter(
@@ -409,21 +486,35 @@ async def _do_redeem(data: RedeemRequest, db: Session):
         group = db.query(TeamGroup).filter(TeamGroup.name == "LinuxDO").first()
         group_id = group.id if group else None
     
-    # 加入队列
+    email = data.email.lower().strip()
+
     try:
-        await enqueue_invite(
-            email=data.email.lower().strip(),
+        team = await send_invite_immediately(
+            db=db,
+            email=email,
             redeem_code=code.code,
             group_id=group_id,
-            linuxdo_user_id=user.id
+            linuxdo_user_id=user.id if user else None,
         )
-        
+
+        await send_invite_telegram_notify(
+            db,
+            email=email,
+            team_name=team.name,
+            redeem_code=code.code,
+            username=user.username if user else None,
+        )
+
         return RedeemResponse(
             success=True,
-            message="已加入队列，邀请将在几秒内发送，请稍后查收邮箱",
-            team_name=None
+            message="邀请已发送，请查收邮箱并接受邀请",
+            team_name=team.name
         )
+    except HTTPException:
+        rollback_redeem_code_usage(db, code.id)
+        raise
     except Exception as e:
+        rollback_redeem_code_usage(db, code.id)
         raise HTTPException(status_code=503, detail=str(e))
 
 
@@ -481,8 +572,7 @@ async def direct_redeem(request: Request, data: DirectRedeemRequest, db: Session
 
 
 async def _do_direct_redeem(data: DirectRedeemRequest, db: Session):
-    """实际执行直接兑换逻辑 - 排队模式"""
-    from app.tasks import enqueue_invite
+    """实际执行直接兑换逻辑 - 成功后才返回"""
     
     # 验证兑换码
     code = db.query(RedeemCode).filter(
@@ -514,18 +604,31 @@ async def _do_direct_redeem(data: DirectRedeemRequest, db: Session):
     
     db.commit()
     
-    # 加入队列
+    email = data.email.lower().strip()
+
     try:
-        await enqueue_invite(
-            email=data.email.lower().strip(),
+        team = await send_invite_immediately(
+            db=db,
+            email=email,
             redeem_code=code.code,
-            group_id=code.group_id
+            group_id=code.group_id,
         )
-        
+
+        await send_invite_telegram_notify(
+            db,
+            email=email,
+            team_name=team.name,
+            redeem_code=code.code,
+        )
+
         return DirectRedeemResponse(
             success=True,
-            message="已加入队列，邀请将在几秒内发送，请稍后查收邮箱",
-            team_name=None
+            message="邀请已发送，请查收邮箱并接受邀请",
+            team_name=team.name
         )
+    except HTTPException:
+        rollback_redeem_code_usage(db, code.id)
+        raise
     except Exception as e:
+        rollback_redeem_code_usage(db, code.id)
         raise HTTPException(status_code=503, detail=str(e))

@@ -153,7 +153,7 @@ export const publicApi = {
   getLinuxDOAuthUrl: () => publicApiClient.get('/linuxdo/auth'),
   linuxdoCallback: (code: string, state: string) => publicApiClient.post('/linuxdo/callback', { code, state }),
   getUserStatus: (token: string) => publicApiClient.get('/user/status', { params: { token } }),
-  redeem: (data: { email: string; redeem_code: string; linuxdo_token: string }) =>
+  redeem: (data: { email: string; redeem_code: string; linuxdo_token?: string }) =>
     publicApiClient.post('/redeem', data),
   getSeats: () => publicApiClient.get('/seats'),
   getSiteConfig: () => publicApiClient.get('/site-config'),

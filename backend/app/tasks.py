@@ -60,7 +60,7 @@ async def process_invite_batch(batch: List[Dict]):
     """批量处理邀请"""
     from app.services.chatgpt_api import ChatGPTAPI, ChatGPTAPIError
     from app.database import SessionLocal
-    from app.models import Team, TeamMember, InviteRecord, InviteStatus, OperationLog, TeamGroup, InviteQueue, InviteQueueStatus
+    from app.models import Team, TeamMember, InviteRecord, InviteStatus, InviteQueue, InviteQueueStatus
     from app.cache import invalidate_seat_cache
     from sqlalchemy import func
     
@@ -69,6 +69,37 @@ async def process_invite_batch(batch: List[Dict]):
     
     db = SessionLocal()
     try:
+        def add_invite_record(
+            team_id: int,
+            item: Dict,
+            status: InviteStatus,
+            batch_id: str = None,
+            error_message: str = None,
+        ):
+            invite = InviteRecord(
+                team_id=team_id,
+                email=item["email"],
+                linuxdo_user_id=item.get("linuxdo_user_id"),
+                status=status,
+                redeem_code=item.get("redeem_code"),
+                batch_id=batch_id,
+                error_message=error_message,
+            )
+            db.add(invite)
+
+        def add_queue_failures(failed_items: List[Dict], failed_group_id: int, error_message: str):
+            for item in failed_items:
+                record = InviteQueue(
+                    email=item["email"],
+                    redeem_code=item.get("redeem_code"),
+                    linuxdo_user_id=item.get("linuxdo_user_id"),
+                    group_id=failed_group_id if failed_group_id else None,
+                    status=InviteQueueStatus.FAILED,
+                    error_message=error_message,
+                    processed_at=datetime.utcnow(),
+                )
+                db.add(record)
+
         # 按 group_id 分组
         groups: Dict[int, List[Dict]] = {}
         for item in batch:
@@ -94,77 +125,125 @@ async def process_invite_batch(batch: List[Dict]):
                 Team.id == member_count_subq.c.team_id
             ).filter(
                 func.coalesce(member_count_subq.c.member_count, 0) < Team.max_seats
-            ).first()
+            ).order_by(Team.id).all()
             
             if not available_team:
                 # 没有空位，标记失败
-                for item in items:
-                    record = InviteQueue(
-                        email=item["email"],
-                        redeem_code=item.get("redeem_code"),
-                        linuxdo_user_id=item.get("linuxdo_user_id"),
-                        group_id=group_id if group_id else None,
-                        status=InviteQueueStatus.FAILED,
-                        error_message="所有 Team 已满",
-                        processed_at=datetime.utcnow()
-                    )
-                    db.add(record)
+                add_queue_failures(items, group_id, "所有 Team 已满")
                 db.commit()
                 logger.warning(f"No available team for group {group_id}")
                 continue
             
-            # 批量邀请
-            emails = [item["email"] for item in items]
-            try:
-                api = ChatGPTAPI(available_team.session_token, available_team.device_id or "")
-                await api.invite_members(available_team.account_id, emails)
+            pending_items = list(items)
+            last_error = "所有可用 Team 邀请失败"
+            
+            for team in available_team:
+                if not pending_items:
+                    break
                 
-                # 记录成功
-                for item in items:
-                    invite = InviteRecord(
-                        team_id=available_team.id,
-                        email=item["email"],
-                        linuxdo_user_id=item.get("linuxdo_user_id"),
-                        status=InviteStatus.SUCCESS,
-                        redeem_code=item.get("redeem_code"),
-                        batch_id=f"batch-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                emails = [item["email"] for item in pending_items]
+                api = ChatGPTAPI(team.session_token, team.device_id or "")
+                
+                try:
+                    await api.invite_members(team.account_id, emails)
+                except ChatGPTAPIError as e:
+                    last_error = e.message
+                    
+                    if e.status_code == 401:
+                        logger.warning(
+                            "Skipping team with expired token",
+                            extra={
+                                "team": team.name,
+                                "team_id": team.id,
+                                "group_id": group_id,
+                                "email_count": len(emails),
+                            },
+                        )
+                        continue
+                    
+                    logger.error(f"Batch invite failed for {team.name}: {e.message}")
+                    
+                    remaining_items: List[Dict] = []
+                    success_emails: List[str] = []
+                    
+                    for index, item in enumerate(pending_items):
+                        try:
+                            await api.invite_members(team.account_id, [item["email"]])
+                            add_invite_record(
+                                team.id,
+                                item,
+                                InviteStatus.SUCCESS,
+                                batch_id=f"retry-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                            )
+                            success_emails.append(item["email"])
+                        except ChatGPTAPIError as retry_error:
+                            last_error = retry_error.message
+                            
+                            if retry_error.status_code == 401:
+                                logger.warning(
+                                    "Skipping team after retry hit expired token",
+                                    extra={
+                                        "team": team.name,
+                                        "team_id": team.id,
+                                        "group_id": group_id,
+                                        "remaining_count": len(pending_items[index:]),
+                                    },
+                                )
+                                remaining_items = pending_items[index:]
+                                break
+                            
+                            add_invite_record(
+                                team.id,
+                                item,
+                                InviteStatus.FAILED,
+                                error_message=retry_error.message[:200],
+                            )
+                        except Exception as retry_exception:
+                            last_error = str(retry_exception)
+                            add_invite_record(
+                                team.id,
+                                item,
+                                InviteStatus.FAILED,
+                                error_message=str(retry_exception)[:200],
+                            )
+                        
+                        await asyncio.sleep(0.5)
+                    
+                    db.commit()
+                    
+                    if success_emails:
+                        invalidate_seat_cache()
+                        await send_batch_telegram_notify(db, success_emails, team.name)
+                    
+                    pending_items = remaining_items
+                    continue
+                
+                batch_id = f"batch-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                for item in pending_items:
+                    add_invite_record(
+                        team.id,
+                        item,
+                        InviteStatus.SUCCESS,
+                        batch_id=batch_id,
                     )
-                    db.add(invite)
                 
                 db.commit()
                 invalidate_seat_cache()
-                logger.info(f"Batch invite success: {len(emails)} emails to {available_team.name}")
-                
-                # 发送 Telegram 通知（批量）
-                await send_batch_telegram_notify(db, emails, available_team.name)
-                
-            except ChatGPTAPIError as e:
-                logger.error(f"Batch invite failed: {e.message}")
-                # 批量失败，逐个重试
-                for item in items:
-                    try:
-                        await api.invite_members(available_team.account_id, [item["email"]])
-                        invite = InviteRecord(
-                            team_id=available_team.id,
-                            email=item["email"],
-                            linuxdo_user_id=item.get("linuxdo_user_id"),
-                            status=InviteStatus.SUCCESS,
-                            redeem_code=item.get("redeem_code"),
-                            batch_id=f"retry-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-                        )
-                        db.add(invite)
-                    except Exception as e2:
-                        invite = InviteRecord(
-                            team_id=available_team.id,
-                            email=item["email"],
-                            linuxdo_user_id=item.get("linuxdo_user_id"),
-                            status=InviteStatus.FAILED,
-                            redeem_code=item.get("redeem_code"),
-                            error_message=str(e2)[:200]
-                        )
-                        db.add(invite)
-                    await asyncio.sleep(0.5)
+                logger.info(f"Batch invite success: {len(emails)} emails to {team.name}")
+                await send_batch_telegram_notify(db, emails, team.name)
+                pending_items = []
+            
+            if pending_items:
+                add_queue_failures(pending_items, group_id, last_error)
                 db.commit()
+                logger.warning(
+                    "All candidate teams failed for invite batch",
+                    extra={
+                        "group_id": group_id,
+                        "remaining_count": len(pending_items),
+                        "error": last_error,
+                    },
+                )
                 
     except Exception as e:
         logger.error(f"Process batch error: {e}")

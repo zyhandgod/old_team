@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 import secrets
+from typing import Optional
 
 from app.database import get_db
 from app.models import User, UserRole, SystemConfig
@@ -104,9 +105,9 @@ async def initialize_system(data: SetupRequest, db: Session = Depends(get_db)):
 # ========== 版本检查 ==========
 class VersionInfo(BaseModel):
     current_version: str
-    latest_version: str | None = None
+    latest_version: Optional[str] = None
     has_update: bool = False
-    update_url: str | None = None
+    update_url: Optional[str] = None
 
 
 @router.get("/version", response_model=VersionInfo)
